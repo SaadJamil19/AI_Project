@@ -1,0 +1,15 @@
+[package]
+name = "semantic-cli-agent-workspace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+members = ["cmd/cli-agent"]
+resolver = "2"
+
+[dev-dependencies]
+cli-agent = { path = "cmd/cli-agent" }
+anyhow = "1"
+rusqlite = { version = "=0.31.0", features = ["bundled"] }
+uuid = { version = "=1.8.0", features = ["v4"] }
