@@ -92,7 +92,7 @@ pub fn initialize_database(conn: &Connection) -> Result<()> {
     configure_connection(conn)?;
     conn.execute_batch(SCHEMA_SQL)
         .context("failed to create semantic-cli-agent schema")?;
-    seed_schema_version(conn)?;
+    seed_schema_metadata(conn)?;
     Ok(())
 }
 
@@ -270,6 +270,28 @@ pub fn learn_from_request(
     let subcommand_path = argv.get(1).cloned().unwrap_or_default();
     let policy_rule_id = find_policy_rule_id(conn, &binary_name, &subcommand_path)
         .with_context(|| format!("no policy rule matches learned command {:?}", argv))?;
+
+    let policy = crate::policy::load_policy_rule(conn, &policy_rule_id).with_context(|| {
+        format!(
+            "failed to load policy rule {} while auditing learned command",
+            policy_rule_id
+        )
+    })?;
+    if let Err(policy_err) = crate::policy::audit_argv_policy(&policy, &argv) {
+        mark_request_security_blocked(conn, request_id).with_context(|| {
+            format!(
+                "corrected command failed policy audit with {}; failed to mark request_id={} SECURITY_BLOCKED",
+                policy_err, request_id
+            )
+        })?;
+        bail!(
+            "corrected command argv {:?} violates policy {}: {}",
+            argv,
+            policy_rule_id,
+            policy_err
+        );
+    }
+
     let context = fetch_learning_context(conn, request_id)?;
     let doc_id = format!("learned_{}", Uuid::new_v4());
     let argv_json = serde_json::to_string(&argv).context("failed to encode learned argv JSON")?;
@@ -319,15 +341,6 @@ pub fn learn_from_request(
         params![request_id],
     )
     .context("failed to mark learned request as approved")?;
-    tx.execute(
-        r#"
-        INSERT INTO schema_metadata(key, value)
-        VALUES('vector_cache_refresh_required', datetime('now'))
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
-        "#,
-        [],
-    )
-    .context("failed to signal vector cache refresh")?;
     tx.commit()
         .context("failed to commit ai-learn template transaction")?;
 
@@ -335,50 +348,8 @@ pub fn learn_from_request(
 }
 
 pub fn tokenize_command_line(input: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
-    let mut single_quote = false;
-    let mut double_quote = false;
-    let mut token_started = false;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' if !double_quote => {
-                single_quote = !single_quote;
-                token_started = true;
-            }
-            '"' if !single_quote => {
-                double_quote = !double_quote;
-                token_started = true;
-            }
-            '\\' if !single_quote => {
-                let next = chars
-                    .next()
-                    .ok_or_else(|| anyhow!("trailing backslash in corrected command"))?;
-                current.push(next);
-                token_started = true;
-            }
-            c if c.is_whitespace() && !single_quote && !double_quote => {
-                if token_started {
-                    tokens.push(std::mem::take(&mut current));
-                    token_started = false;
-                }
-            }
-            c => {
-                current.push(c);
-                token_started = true;
-            }
-        }
-    }
-
-    if single_quote || double_quote {
-        bail!("unterminated quote in corrected command");
-    }
-    if token_started {
-        tokens.push(current);
-    }
-    Ok(tokens)
+    shell_words::split(input)
+        .map_err(|err| anyhow!("failed to parse corrected command as POSIX shell words: {}", err))
 }
 
 fn fetch_learning_context(conn: &Connection, request_id: &str) -> Result<RequestLearningContext> {
@@ -428,10 +399,14 @@ fn find_policy_rule_id(conn: &Connection, binary_name: &str, subcommand_path: &s
     })
 }
 
-fn seed_schema_version(conn: &Connection) -> Result<()> {
+fn seed_schema_metadata(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO schema_metadata(key, value) VALUES('schema_version', ?1)",
         params![SCHEMA_VERSION],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_metadata(key, value) VALUES('unified_documents_generation', '0')",
+        [],
     )?;
     Ok(())
 }
@@ -539,6 +514,24 @@ CREATE TRIGGER IF NOT EXISTS trg_docs_fts_update AFTER UPDATE ON unified_documen
     VALUES ('delete', old.doc_rowid, old.binary_name, old.subcommand_path, old.intent_description);
     INSERT INTO docs_external_fts(rowid, binary_name, subcommand_path, intent_description)
     VALUES (new.doc_rowid, new.binary_name, new.subcommand_path, new.intent_description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_docs_generation_insert AFTER INSERT ON unified_documents BEGIN
+    UPDATE schema_metadata
+    SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = CURRENT_TIMESTAMP
+    WHERE key = 'unified_documents_generation';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_docs_generation_update AFTER UPDATE ON unified_documents BEGIN
+    UPDATE schema_metadata
+    SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = CURRENT_TIMESTAMP
+    WHERE key = 'unified_documents_generation';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_docs_generation_delete AFTER DELETE ON unified_documents BEGIN
+    UPDATE schema_metadata
+    SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = CURRENT_TIMESTAMP
+    WHERE key = 'unified_documents_generation';
 END;
 "#;
 

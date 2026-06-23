@@ -144,6 +144,15 @@ pub fn audit_policy(
     Ok(())
 }
 
+/// Audits only the compiled argv against policy, with no environment checks.
+///
+/// Used at template-ingestion time (`ai-learn`), where there is no live
+/// execution environment to inspect yet; only the corrected argv itself is
+/// being vetted before it can ever be persisted as a reusable template.
+pub fn audit_argv_policy(policy: &PolicyRule, argv: &[String]) -> Result<(), PolicyError> {
+    audit_argv(policy, argv)
+}
+
 pub fn audit_policy_for_request(
     conn: &mut Connection,
     request_id: &str,

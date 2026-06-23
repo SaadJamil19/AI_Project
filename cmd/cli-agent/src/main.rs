@@ -3,6 +3,7 @@ use cli_agent::environment::capture_session_context;
 use cli_agent::execute::execute_interactive;
 use cli_agent::path_validate::{sanitize_terminal_preview_token, validate_workspace_path};
 use cli_agent::policy::{audit_policy_for_request, load_policy_rule, sanitize_preview_tokens};
+use cli_agent::sidecar_signal::notify_cache_invalidation;
 use cli_agent::signals::ShutdownSignals;
 use cli_agent::storage::{
     fetch_trusted_template_by_doc_id, initialize_database, insert_session_record, learn_from_request,
@@ -122,6 +123,19 @@ fn ai_learn() -> Result<()> {
     initialize_database(&conn)?;
     let learned = learn_from_request(&mut conn, &request_id, &corrected_command)?;
     signals.check().context("interrupted after learning transaction")?;
+
+    let socket_path = config.base_dir.join("sidecar.sock");
+    match notify_cache_invalidation(&socket_path, &request_id) {
+        Ok(ack) => eprintln!(
+            "sidecar cache invalidated: {} documents rebuilt in {:.2}ms",
+            ack.document_count, ack.rebuild_duration_ms
+        ),
+        Err(err) => eprintln!(
+            "warning: learned template saved, but sidecar cache invalidation signal failed: {}",
+            err
+        ),
+    }
+
     println!("{}", learned.doc_id);
     Ok(())
 }

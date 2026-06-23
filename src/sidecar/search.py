@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -60,6 +62,39 @@ class SidecarRequest(BaseModel):
         return value
 
 
+class CacheInvalidationRequest(BaseModel):
+    """Active push notification from the trusted Rust client.
+
+    Sent over the same UDS pipe used for search requests immediately after
+    `ai-learn` commits a new template, instead of the sidecar passively
+    polling a database flag for staleness.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol_version: str = Field(min_length=1)
+    command: Literal["invalidate_cache"]
+    request_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("protocol_version")
+    @classmethod
+    def protocol_must_match(cls, value: str) -> str:
+        if value != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol_version {value!r}")
+        return value
+
+
+class CacheInvalidationAck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    protocol_version: str = PROTOCOL_VERSION
+    request_id: str = Field(min_length=1, max_length=128)
+    source_provenance: str = "LOCAL_ML_SIDECAR"
+    status: Literal["CACHE_REBUILT"] = "CACHE_REBUILT"
+    document_count: int = Field(ge=0)
+    rebuild_duration_ms: float = Field(ge=0.0)
+
+
 class RetrievalEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -83,6 +118,7 @@ class SidecarTelemetry(BaseModel):
     lexical_lookup_duration_ms: float = Field(default=0.0, ge=0.0)
     hybrid_rrf_duration_ms: float = Field(default=0.0, ge=0.0)
     fast_path_evaluation_duration_ms: float = Field(default=0.0, ge=0.0)
+    cache_freshness_check_duration_ms: float = Field(default=0.0, ge=0.0)
 
 
 class IntentProposal(BaseModel):
@@ -196,7 +232,15 @@ class SearchService:
         self.encoder = encoder or QueryEncoder()
         self.cache = VectorCache(db_path)
         self.gateway = FastPathGateway()
+        self._generation_lock = threading.Lock()
+        self._known_generation: int | None = None
         self.rebuild_cache()
+
+        conn = open_read_only_database(self.db_path)
+        try:
+            self._known_generation = self._read_generation(conn)
+        finally:
+            conn.close()
 
     def rebuild_cache(self) -> None:
         try:
@@ -216,6 +260,44 @@ class SearchService:
             LOGGER.exception("failed to rebuild sidecar vector cache")
             raise
 
+    @staticmethod
+    def _read_generation(conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'unified_documents_generation'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            LOGGER.error("unified_documents_generation value is not an integer: %r", row["value"])
+            return 0
+
+    def _ensure_cache_fresh(self, conn: sqlite3.Connection) -> None:
+        """Lazy-loading safety net for a dropped active UDS invalidation signal.
+
+        This is a single indexed primary-key lookup, so it stays cheap on the
+        hot query path. It only pays the cost of a full `rebuild_cache()` when
+        the trigger-maintained `unified_documents_generation` counter has
+        actually moved past what this process last observed, which happens
+        whenever the daemon missed (or raced) an explicit invalidation push.
+        """
+
+        current = self._read_generation(conn)
+        if current == self._known_generation:
+            return
+
+        with self._generation_lock:
+            if current == self._known_generation:
+                return
+            LOGGER.warning(
+                "vector cache generation drifted (known=%s, current=%s); rebuilding",
+                self._known_generation,
+                current,
+            )
+            self.rebuild_cache()
+            self._known_generation = self._read_generation(conn)
+
     def search(
         self,
         request: SidecarRequest,
@@ -230,6 +312,10 @@ class SearchService:
 
         conn = open_read_only_database(self.db_path)
         try:
+            freshness_started = time.perf_counter()
+            self._ensure_cache_fresh(conn)
+            freshness_duration_ms = (time.perf_counter() - freshness_started) * 1000.0
+
             lexical_started = time.perf_counter()
             lexical_hits = self._lexical_lookup(conn, request.query, TOP_POOL_LIMIT)
             lexical_duration_ms = (time.perf_counter() - lexical_started) * 1000.0
@@ -258,6 +344,7 @@ class SearchService:
                 lexical_lookup_duration_ms=lexical_duration_ms,
                 hybrid_rrf_duration_ms=rrf_duration_ms,
                 fast_path_evaluation_duration_ms=0.0,
+                cache_freshness_check_duration_ms=freshness_duration_ms,
             )
 
             fast_started = time.perf_counter()
@@ -540,6 +627,34 @@ class SearchService:
             return proposal.model_dump_json(exclude_none=False).encode("utf-8") + b"\n"
         except Exception:
             LOGGER.exception("failed to handle sidecar JSON payload")
+            raise
+
+    def handle_invalidate_json(self, payload: bytes) -> bytes:
+        """Synchronously clear and rebuild the FAISS cache from SQLite.
+
+        Runs on the worker thread handling the invalidation socket request,
+        so the daemon has already rebuilt before it accepts the next query.
+        """
+
+        try:
+            request = CacheInvalidationRequest.model_validate_json(payload)
+            started = time.perf_counter()
+            with self._generation_lock:
+                self.rebuild_cache()
+                conn = open_read_only_database(self.db_path)
+                try:
+                    self._known_generation = self._read_generation(conn)
+                finally:
+                    conn.close()
+            rebuild_duration_ms = (time.perf_counter() - started) * 1000.0
+            ack = CacheInvalidationAck(
+                request_id=request.request_id,
+                document_count=len(self.cache.documents()),
+                rebuild_duration_ms=rebuild_duration_ms,
+            )
+            return ack.model_dump_json().encode("utf-8") + b"\n"
+        except Exception:
+            LOGGER.exception("failed to handle sidecar cache invalidation request")
             raise
 
 

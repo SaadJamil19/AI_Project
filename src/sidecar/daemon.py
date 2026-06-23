@@ -93,15 +93,27 @@ class SidecarRequestHandler(socketserver.StreamRequestHandler):
                 self._write_error("payload_too_large", "request exceeds 64KiB")
                 return
 
-            response = self.server.service.handle_json(
-                payload.strip(),
-                dequeued_at=handler_started_at,
-            )
+            stripped = payload.strip()
+            if self._is_invalidation_command(stripped):
+                response = self.server.service.handle_invalidate_json(stripped)
+            else:
+                response = self.server.service.handle_json(
+                    stripped,
+                    dequeued_at=handler_started_at,
+                )
             self.wfile.write(response)
         except ValidationError as exc:
             self._write_error("validation_error", exc.json())
         except Exception as exc:  # Deliberate boundary: never crash worker thread on bad client input.
             self._write_error("internal_error", str(exc))
+
+    @staticmethod
+    def _is_invalidation_command(payload: bytes) -> bool:
+        try:
+            envelope = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(envelope, dict) and envelope.get("command") == "invalidate_cache"
 
     def _write_error(self, code: str, message: str) -> None:
         safe_message = message.replace("\n", " ")[:4096]

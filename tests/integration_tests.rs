@@ -240,6 +240,35 @@ fn fts_insert_update_delete_triggers_track_unified_documents() -> Result<()> {
     Ok(())
 }
 
+fn read_generation(conn: &Connection) -> Result<i64> {
+    let raw: String = conn.query_row(
+        "SELECT value FROM schema_metadata WHERE key = 'unified_documents_generation'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(raw.parse::<i64>()?)
+}
+
+#[test]
+fn unified_documents_generation_counter_increments_on_mutation() -> Result<()> {
+    let (_config, conn) = open_test_db("generation-counter")?;
+
+    assert_eq!(read_generation(&conn)?, 0);
+
+    let rowid = insert_static_doc(&conn, "doc_generation_insert", "restore a tracked file")?;
+    assert_eq!(read_generation(&conn)?, 1);
+
+    conn.execute(
+        "UPDATE unified_documents SET intent_description = 'updated description' WHERE doc_rowid = ?1",
+        params![rowid],
+    )?;
+    assert_eq!(read_generation(&conn)?, 2);
+
+    conn.execute("DELETE FROM unified_documents WHERE doc_rowid = ?1", params![rowid])?;
+    assert_eq!(read_generation(&conn)?, 3);
+    Ok(())
+}
+
 #[test]
 fn foreign_keys_reject_documents_without_policy_rule() -> Result<()> {
     let config = StorageConfig::from_base_dir(test_base_dir("fk-doc"));
@@ -602,12 +631,124 @@ fn ai_learn_inserts_template_and_updates_fts_index() -> Result<()> {
     assert_eq!(row.1, "UNVERIFIED");
     assert!(row.2.contains("file with spaces.rs"));
     assert_eq!(fts_count(&conn, "restore")?, 1);
+    assert_eq!(
+        read_generation(&conn)?,
+        1,
+        "the trigger-maintained generation counter must advance inside the same \
+         commit that inserts the learned template, so the sidecar's lazy-loading \
+         freshness check can detect a dropped UDS invalidation signal"
+    );
+    Ok(())
+}
 
-    let refresh_required: String = conn.query_row(
-        "SELECT value FROM schema_metadata WHERE key = 'vector_cache_refresh_required'",
+#[test]
+fn tokenizer_rejects_mismatched_quotes_via_shell_words() {
+    let result = tokenize_command_line(r#"git restore "unterminated"#);
+    assert!(result.is_err());
+}
+
+#[test]
+fn ai_learn_rejects_unparseable_corrected_command_without_mutating_request_status() -> Result<()> {
+    let (_config, mut conn) = open_test_db("ai-learn-parse-error")?;
+    seed_session_and_request(&conn, "req_learn_unparseable")?;
+
+    let result = learn_from_request(&mut conn, "req_learn_unparseable", r#"git restore "unterminated"#);
+    assert!(result.is_err());
+
+    let status: String = conn.query_row(
+        "SELECT execution_status FROM request_records WHERE request_id = 'req_learn_unparseable'",
         [],
         |row| row.get(0),
     )?;
-    assert!(!refresh_required.is_empty());
+    assert_eq!(status, "PENDING");
+    Ok(())
+}
+
+#[test]
+fn ai_learn_blocks_policy_violating_corrected_command_and_marks_security_blocked() -> Result<()> {
+    let (_config, mut conn) = open_test_db("ai-learn-policy-block")?;
+    seed_session_and_request(&conn, "req_learn_privilege_risk")?;
+
+    let result = learn_from_request(&mut conn, "req_learn_privilege_risk", "git restore sudo");
+    assert!(result.is_err());
+
+    let status: String = conn.query_row(
+        "SELECT execution_status FROM request_records WHERE request_id = 'req_learn_privilege_risk'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(status, "SECURITY_BLOCKED");
+
+    let inserted: i64 = conn.query_row(
+        "SELECT count(*) FROM unified_documents WHERE created_from_request_id = 'req_learn_privilege_risk'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(inserted, 0);
+    Ok(())
+}
+
+#[test]
+fn execute_interactive_maps_child_exit_status() -> Result<()> {
+    use cli_agent::execute::execute_interactive;
+
+    let success = execute_interactive(&["true".to_owned()])?;
+    assert!(success.success);
+    assert_eq!(success.status_code, Some(0));
+
+    let failure = execute_interactive(&[
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "exit 7".to_owned(),
+    ])?;
+    assert!(!failure.success);
+    assert_eq!(failure.status_code, Some(7));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_invalidation_signal_round_trips_over_unix_socket() -> Result<()> {
+    use cli_agent::sidecar_signal::notify_cache_invalidation;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let dir = test_base_dir("sidecar-signal");
+    let socket_path = dir.join("sidecar.sock");
+    let listener = UnixListener::bind(&socket_path)?;
+
+    let handle = std::thread::spawn(move || -> Result<String> {
+        let (mut stream, _addr) = listener.accept()?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        stream.write_all(
+            br#"{"protocol_version":"1.0.0","request_id":"req_signal_test","source_provenance":"LOCAL_ML_SIDECAR","status":"CACHE_REBUILT","document_count":3,"rebuild_duration_ms":12.5}
+"#,
+        )?;
+        Ok(line)
+    });
+
+    let ack = notify_cache_invalidation(&socket_path, "req_signal_test")?;
+    assert_eq!(ack.status, "CACHE_REBUILT");
+    assert_eq!(ack.document_count, 3);
+    assert_eq!(ack.request_id, "req_signal_test");
+
+    let received_request = handle.join().expect("listener thread panicked")?;
+    assert!(received_request.contains(r#""command":"invalidate_cache""#));
+    assert!(received_request.contains(r#""request_id":"req_signal_test""#));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_invalidation_signal_reports_missing_socket_without_hanging() -> Result<()> {
+    use cli_agent::sidecar_signal::{notify_cache_invalidation, SidecarSignalError};
+
+    let dir = test_base_dir("sidecar-signal-missing");
+    let socket_path = dir.join("sidecar.sock");
+
+    let result = notify_cache_invalidation(&socket_path, "req_missing_socket");
+    assert!(matches!(result, Err(SidecarSignalError::SocketMissing(_))));
     Ok(())
 }
