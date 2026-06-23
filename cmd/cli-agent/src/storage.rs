@@ -9,6 +9,29 @@ use uuid::Uuid;
 pub const SCHEMA_VERSION: &str = "phase1.2";
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedTemplate {
+    pub doc_id: String,
+    pub template_argv_json: String,
+    pub slot_schema_json: String,
+    pub policy_rule_id: String,
+    pub trust_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedTemplate {
+    pub doc_id: String,
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestLearningContext {
+    request_id: String,
+    raw_user_prompt: String,
+    canonical_cwd: String,
+    canonical_git_root: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
     pub base_dir: PathBuf,
@@ -150,6 +173,259 @@ pub fn insert_session_record(conn: &Connection, context: &SessionContext) -> Res
     )
     .context("failed to insert session record")?;
     Ok(session_id)
+}
+
+pub fn fetch_trusted_template_by_doc_id(
+    conn: &Connection,
+    candidate_template_id: &str,
+) -> Result<TrustedTemplate> {
+    if candidate_template_id.trim().is_empty() {
+        bail!("candidate_template_id must not be empty");
+    }
+
+    conn.query_row(
+        r#"
+        SELECT
+            doc_id,
+            template_argv_json,
+            slot_schema_json,
+            policy_rule_id,
+            trust_state
+        FROM unified_documents
+        WHERE doc_id = ?1
+        LIMIT 1
+        "#,
+        params![candidate_template_id],
+        |row| {
+            Ok(TrustedTemplate {
+                doc_id: row.get(0)?,
+                template_argv_json: row.get(1)?,
+                slot_schema_json: row.get(2)?,
+                policy_rule_id: row.get(3)?,
+                trust_state: row.get(4)?,
+            })
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to fetch trusted template and slot schema for candidate_template_id={}",
+            candidate_template_id
+        )
+    })
+}
+
+pub fn mark_request_security_blocked(conn: &mut Connection, request_id: &str) -> Result<()> {
+    if request_id.trim().is_empty() {
+        bail!("request_id must not be empty");
+    }
+
+    let tx = conn
+        .transaction()
+        .context("failed to start SECURITY_BLOCKED request status transaction")?;
+    let changed = tx
+        .execute(
+            r#"
+            UPDATE request_records
+            SET execution_status = 'SECURITY_BLOCKED'
+            WHERE request_id = ?1
+              AND execution_status IN ('PENDING', 'APPROVED', 'REJECTED')
+            "#,
+            params![request_id],
+        )
+        .with_context(|| {
+            format!(
+                "failed to transition request_id={} to SECURITY_BLOCKED",
+                request_id
+            )
+        })?;
+
+    if changed != 1 {
+        bail!(
+            "request_id={} was not transitioned to SECURITY_BLOCKED; request missing or already terminal",
+            request_id
+        );
+    }
+
+    tx.commit()
+        .context("failed to commit SECURITY_BLOCKED request status transaction")?;
+    Ok(())
+}
+
+pub fn learn_from_request(
+    conn: &mut Connection,
+    request_id: &str,
+    corrected_command: &str,
+) -> Result<LearnedTemplate> {
+    if request_id.trim().is_empty() {
+        bail!("request_id must not be empty");
+    }
+
+    let argv = tokenize_command_line(corrected_command)
+        .with_context(|| format!("failed to tokenize corrected command for request_id={}", request_id))?;
+    if argv.is_empty() {
+        bail!("corrected command must not be empty");
+    }
+
+    let binary_name = argv[0].clone();
+    let subcommand_path = argv.get(1).cloned().unwrap_or_default();
+    let policy_rule_id = find_policy_rule_id(conn, &binary_name, &subcommand_path)
+        .with_context(|| format!("no policy rule matches learned command {:?}", argv))?;
+    let context = fetch_learning_context(conn, request_id)?;
+    let doc_id = format!("learned_{}", Uuid::new_v4());
+    let argv_json = serde_json::to_string(&argv).context("failed to encode learned argv JSON")?;
+    let slot_schema_json = "[]";
+    let scope_anchor = context
+        .canonical_git_root
+        .clone()
+        .unwrap_or_else(|| context.canonical_cwd.clone());
+    let project_root_hash = format!("learned:{}", scope_anchor);
+
+    let tx = conn
+        .transaction()
+        .context("failed to start ai-learn template transaction")?;
+    tx.execute(
+        r#"
+        INSERT INTO unified_documents (
+            doc_id,
+            source_type,
+            binary_name,
+            subcommand_path,
+            intent_description,
+            template_argv_json,
+            slot_schema_json,
+            policy_rule_id,
+            project_root_hash,
+            scope_mode,
+            trust_state,
+            created_from_request_id
+        )
+        VALUES (?1, 'USER_TEMPLATE', ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'PROJECT', 'UNVERIFIED', ?9)
+        "#,
+        params![
+            doc_id,
+            binary_name,
+            subcommand_path,
+            context.raw_user_prompt,
+            argv_json,
+            slot_schema_json,
+            policy_rule_id,
+            project_root_hash,
+            context.request_id,
+        ],
+    )
+    .context("failed to insert learned template")?;
+    tx.execute(
+        "UPDATE request_records SET execution_status = 'APPROVED' WHERE request_id = ?1",
+        params![request_id],
+    )
+    .context("failed to mark learned request as approved")?;
+    tx.execute(
+        r#"
+        INSERT INTO schema_metadata(key, value)
+        VALUES('vector_cache_refresh_required', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        "#,
+        [],
+    )
+    .context("failed to signal vector cache refresh")?;
+    tx.commit()
+        .context("failed to commit ai-learn template transaction")?;
+
+    Ok(LearnedTemplate { doc_id, argv })
+}
+
+pub fn tokenize_command_line(input: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut token_started = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !double_quote => {
+                single_quote = !single_quote;
+                token_started = true;
+            }
+            '"' if !single_quote => {
+                double_quote = !double_quote;
+                token_started = true;
+            }
+            '\\' if !single_quote => {
+                let next = chars
+                    .next()
+                    .ok_or_else(|| anyhow!("trailing backslash in corrected command"))?;
+                current.push(next);
+                token_started = true;
+            }
+            c if c.is_whitespace() && !single_quote && !double_quote => {
+                if token_started {
+                    tokens.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                token_started = true;
+            }
+        }
+    }
+
+    if single_quote || double_quote {
+        bail!("unterminated quote in corrected command");
+    }
+    if token_started {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn fetch_learning_context(conn: &Connection, request_id: &str) -> Result<RequestLearningContext> {
+    conn.query_row(
+        r#"
+        SELECT
+            r.request_id,
+            r.raw_user_prompt,
+            s.canonical_cwd,
+            s.canonical_git_root
+        FROM request_records AS r
+        JOIN session_records AS s ON s.session_id = r.session_id
+        WHERE r.request_id = ?1
+          AND r.expires_at > datetime('now')
+        LIMIT 1
+        "#,
+        params![request_id],
+        |row| {
+            Ok(RequestLearningContext {
+                request_id: row.get(0)?,
+                raw_user_prompt: row.get(1)?,
+                canonical_cwd: row.get(2)?,
+                canonical_git_root: row.get(3)?,
+            })
+        },
+    )
+    .with_context(|| format!("request_id={} is missing or expired", request_id))
+}
+
+fn find_policy_rule_id(conn: &Connection, binary_name: &str, subcommand_path: &str) -> Result<String> {
+    conn.query_row(
+        r#"
+        SELECT rule_id
+        FROM policy_rules
+        WHERE binary_name = ?1
+          AND subcommand_path = ?2
+        LIMIT 1
+        "#,
+        params![binary_name, subcommand_path],
+        |row| row.get(0),
+    )
+    .with_context(|| {
+        format!(
+            "policy rule not found for binary={} subcommand={}",
+            binary_name, subcommand_path
+        )
+    })
 }
 
 fn seed_schema_version(conn: &Connection) -> Result<()> {

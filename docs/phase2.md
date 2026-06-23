@@ -10,8 +10,10 @@ binding, path validation, confirmation, and process spawning.
   signal cleanup.
 - `src/sidecar/cache.py`: read-only SQLite extraction and in-memory FAISS
   `IndexIDMap(IndexFlatIP)` cache.
-- `src/sidecar/search.py`: hot Sentence-Transformers encoder and strict
-  Pydantic request/response schemas.
+- `src/sidecar/search.py`: hot Sentence-Transformers encoder, hybrid retrieval,
+  and strict Pydantic request/response schemas.
+- `src/sidecar/gateway.py`: deterministic fast-path gate for static low-risk
+  templates.
 - `requirements-sidecar.txt`: Python dependencies for the sidecar runtime.
 
 ## Runtime Model
@@ -56,7 +58,10 @@ Responses include a telemetry object:
 {
   "telemetry": {
     "faiss_matrix_scan_duration_ms": 0.14,
-    "python_scheduling_delay_ms": 0.03
+    "python_scheduling_delay_ms": 0.03,
+    "lexical_lookup_duration_ms": 0.21,
+    "hybrid_rrf_duration_ms": 0.02,
+    "fast_path_evaluation_duration_ms": 0.01
   }
 }
 ```
