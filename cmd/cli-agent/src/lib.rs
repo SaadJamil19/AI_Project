@@ -1,6 +1,8 @@
 pub mod environment;
 pub mod execute;
+pub mod ipc;
 pub mod path_validate;
+pub mod pipeline;
 pub mod policy;
 pub mod sidecar_signal;
 pub mod signals;

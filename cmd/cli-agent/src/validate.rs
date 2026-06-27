@@ -35,6 +35,10 @@ pub enum SlotValidationError {
     IntegerOutOfBounds { slot: String, value: i64 },
     #[error("slot {slot} must be a JSON string")]
     NonStringSlot { slot: String },
+    #[error("template argv JSON is invalid: {0}")]
+    TemplateArgvInvalid(String),
+    #[error("template references unbound placeholder: {0}")]
+    UnboundPlaceholder(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +108,77 @@ pub fn bind_template_slots(
 ) -> Result<BoundSlots, SlotValidationError> {
     validate_template_lifecycle(trust_state)?;
     bind_and_validate_slots(slot_schema_json, raw_untrusted_slots_json)
+}
+
+/// Substitutes bound, trusted slot values into a trusted template's argv array.
+///
+/// `template_argv_json` is always the value loaded from `unified_documents` via
+/// `fetch_trusted_template_by_doc_id`, never anything Python sent over the
+/// wire. Tokens that match a placeholder shape (`$name`, `${name}`, `<name>`,
+/// or `:name`) are replaced with the matching value from `slots`; every other
+/// token is copied through literally. A placeholder with no matching bound
+/// slot is a hard error rather than being silently dropped or left in the
+/// final argv, since `bind_template_slots` already guarantees every
+/// `required: true` slot is present by this point.
+pub fn compile_template_argv(
+    template_argv_json: &str,
+    slots: &BoundSlots,
+) -> Result<Vec<String>, SlotValidationError> {
+    let template: Vec<String> = serde_json::from_str(template_argv_json)
+        .map_err(|err| SlotValidationError::TemplateArgvInvalid(err.to_string()))?;
+
+    template
+        .into_iter()
+        .map(|token| match placeholder_name(&token) {
+            Some(name) => slots
+                .get(&name)
+                .map(str::to_owned)
+                .ok_or(SlotValidationError::UnboundPlaceholder(name)),
+            None => Ok(token),
+        })
+        .collect()
+}
+
+/// Returns the names of every slot in `slot_schema_json` whose declared
+/// `allowed_formats` mark it as filesystem-path-shaped, so callers can run
+/// those specific bound values through `path_validate::validate_workspace_path`
+/// without needing to know the slot schema's internal representation.
+pub fn path_like_slot_names(slot_schema_json: &str) -> Result<Vec<String>, SlotValidationError> {
+    let schema = parse_schema(slot_schema_json)?;
+    Ok(schema
+        .into_iter()
+        .filter(|rule| {
+            rule.allowed_formats
+                .iter()
+                .any(|format| matches!(format.as_str(), "relative_path" | "path" | "filename"))
+        })
+        .map(|rule| rule.name)
+        .collect())
+}
+
+fn placeholder_name(token: &str) -> Option<String> {
+    let candidate = if let Some(inner) = token.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        inner
+    } else if let Some(inner) = token.strip_prefix('$') {
+        inner
+    } else if let Some(inner) = token.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        inner
+    } else if let Some(inner) = token.strip_prefix(':') {
+        inner
+    } else {
+        return None;
+    };
+
+    is_identifier(candidate).then(|| candidate.to_owned())
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub fn validate_template_lifecycle(trust_state: &str) -> Result<(), SlotValidationError> {

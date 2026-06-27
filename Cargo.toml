@@ -12,4 +12,5 @@ resolver = "2"
 cli-agent = { path = "cmd/cli-agent" }
 anyhow = "1"
 rusqlite = { version = "=0.31.0", features = ["bundled"] }
+shell-words = "1.1"
 uuid = { version = "=1.8.0", features = ["v4"] }

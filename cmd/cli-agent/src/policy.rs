@@ -27,6 +27,8 @@ pub enum PolicyError {
     NetworkRisk(String),
     #[error("recursive destructive argument blocked: {0}")]
     DestructiveRisk(String),
+    #[error("data-flag argument reads a local file for exfiltration: {0} {1}")]
+    DataFlagFileRead(String, String),
     #[error("policy rule not found: {0}")]
     RuleNotFound(String),
     #[error("failed to mark request SECURITY_BLOCKED: {0}")]
@@ -215,7 +217,8 @@ fn audit_argv(policy: &PolicyRule, argv: &[String]) -> Result<(), PolicyError> {
         .map(String::as_str)
         .collect();
 
-    for arg in argv.iter().skip(1) {
+    let positional = &argv[1..];
+    for (index, arg) in positional.iter().enumerate() {
         if blocked_flags.contains(arg.as_str()) {
             return Err(PolicyError::FlagBlocked(arg.clone()));
         }
@@ -238,6 +241,13 @@ fn audit_argv(policy: &PolicyRule, argv: &[String]) -> Result<(), PolicyError> {
             && is_destructive_recursive_arg(arg)
         {
             return Err(PolicyError::DestructiveRisk(arg.clone()));
+        }
+        if is_data_flag(arg) {
+            if let Some(value) = positional.get(index + 1) {
+                if is_local_file_reference(value) {
+                    return Err(PolicyError::DataFlagFileRead(arg.clone(), value.clone()));
+                }
+            }
         }
     }
 
@@ -308,4 +318,21 @@ fn is_network_arg(arg: &str) -> bool {
 
 fn is_destructive_recursive_arg(arg: &str) -> bool {
     matches!(arg, "-rf" | "-fr" | "--recursive" | "--force")
+}
+
+/// Flags whose *value* (the next argv token) is itself untrusted file/data
+/// content, not just another flag. curl-family `@filename` syntax means
+/// "read this local file and use its contents as the value" - a classic
+/// local-file-read-then-send-to-a-remote-host exfiltration primitive that
+/// no other check here inspects, since every other check only looks at
+/// flag tokens themselves, never the argument that follows one.
+fn is_data_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-urlencode" | "-F" | "--form"
+    )
+}
+
+fn is_local_file_reference(value: &str) -> bool {
+    value.starts_with('@')
 }

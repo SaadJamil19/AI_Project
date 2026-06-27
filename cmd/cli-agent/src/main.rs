@@ -2,17 +2,27 @@ use anyhow::{bail, Context, Result};
 use cli_agent::environment::capture_session_context;
 use cli_agent::execute::execute_interactive;
 use cli_agent::path_validate::{sanitize_terminal_preview_token, validate_workspace_path};
+use cli_agent::pipeline::{
+    observe_manual_command, resolve_natural_language_command, NaturalLanguageOutcome,
+    OBSERVATION_WINDOW_MINUTES,
+};
 use cli_agent::policy::{audit_policy_for_request, load_policy_rule, sanitize_preview_tokens};
 use cli_agent::sidecar_signal::notify_cache_invalidation;
 use cli_agent::signals::ShutdownSignals;
 use cli_agent::storage::{
     fetch_trusted_template_by_doc_id, initialize_database, insert_session_record, learn_from_request,
-    mark_request_security_blocked, StorageConfig,
+    mark_request_approved, mark_request_security_blocked, StorageConfig,
 };
 use cli_agent::validate::bind_template_slots;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Real shell-builtin-style commands that a user might literally type but
+/// that never exist as files on `PATH`. Anything not on `PATH` and not in
+/// this small allowlist is treated as a natural-language prompt instead of
+/// a literal command to spawn.
+const HARD_ALLOWLISTED_COMMANDS: &[&str] = &["cd", "pwd", "exit", "true", "false"];
 
 fn main() -> Result<()> {
     let command = std::env::args().nth(1).unwrap_or_else(|| "init".to_owned());
@@ -65,10 +75,15 @@ fn record_session() -> Result<()> {
 fn ai_run() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(2).collect();
     if argv.is_empty() {
-        bail!("ai-run requires a command and arguments");
+        bail!("ai-run requires a command, or a natural-language description in quotes");
     }
 
     let signals = ShutdownSignals::install().context("failed to install signal handlers")?;
+
+    if !looks_like_executable_argv(&argv) {
+        return ai_run_natural_language(&argv, &signals);
+    }
+
     render_preview(&argv)?;
     signals.check().context("interrupted before confirmation")?;
     if !confirm_execute(&signals)? {
@@ -80,7 +95,161 @@ fn ai_run() -> Result<()> {
     if !result.success {
         bail!("child exited with status {:?}", result.status_code);
     }
+    observe_executed_literal_command(&argv);
     Ok(())
+}
+
+/// Best-effort hook into the passive-observation loop: lets it know a
+/// literal command just ran successfully, in case it's the manual
+/// correction for a recent natural-language miss in this terminal. Never
+/// allowed to fail the command that already ran — any error here is only
+/// ever printed to stderr, never propagated, since by this point the
+/// user's actual command has already completed.
+fn observe_executed_literal_command(argv: &[String]) {
+    let outcome = (|| -> Result<Option<String>> {
+        let config = StorageConfig::discover()?;
+        let conn = config.open()?;
+        initialize_database(&conn)?;
+        let context = capture_session_context()?;
+        observe_manual_command(&conn, &context, argv)
+    })();
+
+    match outcome {
+        Ok(Some(prompt)) => eprintln!(
+            "noted: if you ask ai-run \"{}\" again, I can offer to learn this command",
+            prompt
+        ),
+        Ok(None) => {}
+        Err(err) => eprintln!(
+            "warning: passive-observation hook failed (command already ran fine): {}",
+            err
+        ),
+    }
+}
+
+/// Decides whether `argv[0]` is a literal command to spawn directly, versus
+/// a natural-language prompt that needs to go through the sidecar/template
+/// pipeline. This is intentionally conservative: anything that isn't a real
+/// executable on `PATH` (or in the small builtin allowlist) is treated as
+/// natural language rather than guessed at.
+fn looks_like_executable_argv(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+
+    if first.is_empty() || first.starts_with('-') {
+        return false;
+    }
+
+    if HARD_ALLOWLISTED_COMMANDS.contains(&first.as_str()) {
+        return true;
+    }
+
+    if first.contains('/') {
+        return is_executable_file(Path::new(first));
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(first)))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn ai_run_natural_language(argv: &[String], signals: &ShutdownSignals) -> Result<()> {
+    let raw_prompt = argv.join(" ");
+    println!("interpreting natural-language request: \"{}\"", raw_prompt);
+
+    let config = StorageConfig::discover()?;
+    let mut conn = config.open()?;
+    initialize_database(&conn)?;
+    let context = capture_session_context().context("failed to capture session context")?;
+    signals.check().context("interrupted before sidecar lookup")?;
+
+    let socket_path = config.base_dir.join("sidecar.sock");
+    let outcome = resolve_natural_language_command(&mut conn, &context, &socket_path, &raw_prompt)
+        .context("natural-language interpretation failed")?;
+
+    match outcome {
+        NaturalLanguageOutcome::Resolved(resolved) => {
+            signals.check().context("interrupted before confirmation")?;
+            render_preview(&resolved.argv)?;
+            if !confirm_execute(signals)? {
+                println!("aborted");
+                return Ok(());
+            }
+
+            signals.check().context("interrupted before execution")?;
+            let result =
+                execute_interactive(&resolved.argv).context("child process execution failed")?;
+            if result.success {
+                mark_request_approved(&mut conn, &resolved.request_id)
+                    .context("failed to mark request approved after execution")?;
+            } else {
+                bail!("child exited with status {:?}", result.status_code);
+            }
+            Ok(())
+        }
+
+        NaturalLanguageOutcome::Observing { request_id } => {
+            println!("no matching command template yet for this prompt (request_id={request_id}).");
+            println!(
+                "if you run the right command manually with ai-run in the next {} minutes, \
+                 I'll remember it and offer to learn it the next time you ask this.",
+                OBSERVATION_WINDOW_MINUTES
+            );
+            Ok(())
+        }
+
+        NaturalLanguageOutcome::LearnFromObservedCorrection {
+            request_id,
+            suggested_argv,
+        } => {
+            signals.check().context("interrupted before learn confirmation")?;
+            render_preview(&suggested_argv)?;
+            let preview_line = shell_words::join(sanitize_preview_tokens(&suggested_argv));
+            let prompt_text = format!(
+                "I observed you manually run \"{}\" after this query last time. Learn it as a template? [y/N]: ",
+                preview_line
+            );
+            if !confirm_prompt(signals, &prompt_text)? {
+                println!("not learned; you can ask again later");
+                return Ok(());
+            }
+
+            signals.check().context("interrupted before learning")?;
+            let corrected_command = shell_words::join(&suggested_argv);
+            let learned = learn_from_request(&mut conn, &request_id, &corrected_command)
+                .context("failed to learn the observed correction")?;
+
+            match notify_cache_invalidation(&socket_path, &request_id) {
+                Ok(ack) => eprintln!(
+                    "sidecar cache invalidated: {} documents rebuilt in {:.2}ms",
+                    ack.document_count, ack.rebuild_duration_ms
+                ),
+                Err(err) => eprintln!(
+                    "warning: learned template saved, but sidecar cache invalidation signal failed: {}",
+                    err
+                ),
+            }
+
+            println!("learned {}", learned.doc_id);
+            Ok(())
+        }
+    }
 }
 
 fn execute_argv_json() -> Result<()> {
@@ -250,7 +419,11 @@ fn render_preview(argv: &[String]) -> Result<()> {
 }
 
 fn confirm_execute(signals: &ShutdownSignals) -> Result<bool> {
-    print!("Execute? [y/N]: ");
+    confirm_prompt(signals, "Execute? [y/N]: ")
+}
+
+fn confirm_prompt(signals: &ShutdownSignals, prompt: &str) -> Result<bool> {
+    print!("{}", prompt);
     io::stdout().flush().context("failed to flush confirmation prompt")?;
     signals.check().context("interrupted during confirmation")?;
     let mut answer = String::new();
@@ -267,6 +440,7 @@ fn print_help() {
     println!("  capture-session                           print current terminal/session metadata as JSON");
     println!("  record-session                            initialize storage and persist current session record");
     println!("  ai-run <command> [args...]                 preview, confirm, and execute literal argv");
+    println!("  ai-run <natural language...>               resolve via the sidecar + template pipeline, then preview/confirm/execute");
     println!("  execute-argv <argv-json>                   execute literal argv JSON without shell translation");
     println!("  ai-learn --request-id <id> <command>       learn an explicit corrected command");
     println!("  validate-slots <request-id> <template-id> <slots-json> validate untrusted daemon slots against trusted schema");

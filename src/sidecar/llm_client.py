@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -23,7 +24,17 @@ class RetrievalEvidence(BaseModel):
     fts5_lexical_score: float | None = None
     vector_cosine_distance: float | None = None
     vector_rank: int | None = None
-    embedding_duration_ms: float = Field(ge=0.0)
+    # No ge=0.0 here on purpose: the model has no real way to know how long
+    # embedding took (it isn't running the encoder), so it's just filling in
+    # a number to satisfy the schema shape. Ollama's grammar-constrained
+    # decoding enforces JSON *structure* but not numeric range constraints
+    # like the schema's "minimum": 0 below, so a hallucinated negative value
+    # is a real, observed response from phi3:mini, not a hypothetical edge
+    # case. search.py never reads this field from the LLM's response anyway
+    # (it always substitutes its own measured evidence), so rejecting the
+    # whole proposal over a meaningless number here would only make the
+    # fallback flakier for no safety benefit.
+    embedding_duration_ms: float = 0.0
 
 
 class RiskHints(BaseModel):
@@ -64,7 +75,7 @@ class UntrustedProposal(BaseModel):
 class OllamaClientConfig:
     endpoint: str = DEFAULT_OLLAMA_URL
     model: str = DEFAULT_MODEL
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 180.0
 
 
 class OllamaProtocolError(RuntimeError):
@@ -157,7 +168,7 @@ class OllamaClient:
         try:
             with self._opener.open(request, timeout=self.config.timeout_seconds) as response:
                 raw = response.read()
-        except urllib.error.URLError as exc:
+        except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
             LOGGER.exception("Ollama request failed")
             raise ConnectionError(f"failed to reach local Ollama at {self.config.endpoint}") from exc
 

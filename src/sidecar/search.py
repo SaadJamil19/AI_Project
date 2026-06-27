@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -34,6 +35,7 @@ from .cache import (
     open_read_only_database,
 )
 from .gateway import FastPathGateway
+from .llm_client import OllamaClient, OllamaProtocolError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +44,51 @@ PROTOCOL_VERSION = "1.0.0"
 RRF_K = 60
 TOP_POOL_LIMIT = 5
 FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:+-]+")
+# SQLite FTS5's default unicode61 tokenizer does not remove stop words, so
+# without this, a query sharing only a pronoun or article with some
+# unrelated seeded description (e.g. "me" in "give me a curl command" vs.
+# "me" in "show me the current ... status") registers as a real lexical
+# match. That's enough to set lexical_rank, which short-circuits the
+# topical-relevance floor below (any lexical match is trusted outright) -
+# so an utterly unrelated query can still land a confident, wrong match.
+FTS_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "but", "if", "then", "else",
+        "to", "of", "in", "on", "at", "by", "for", "with", "about",
+        "from", "into", "as", "is", "are", "was", "were", "be", "been",
+        "being", "do", "does", "did", "doing", "have", "has", "had",
+        "i", "me", "my", "you", "your", "it", "its", "this", "that",
+        "these", "those", "he", "she", "they", "we", "us", "them",
+        # Not classic linguistic stopwords, but generic request-framing
+        # words that carry zero information about *which* command is
+        # wanted. Without these, a learned template whose intent_description
+        # is literally the user's own original phrasing (e.g. "give me a
+        # curl command...") keeps lexically matching every future request
+        # phrased the same generic way (e.g. "give me a command to commit
+        # on github") purely on shared filler words - a real, observed false
+        # match, not a hypothetical one.
+        "give", "show", "get", "command", "want", "need", "please", "tell",
+    }
+)
+# A hit ranked #1 in at least one of the two retrieval modalities scores at
+# least 1/(RRF_K + 1) under reciprocal rank fusion. Below that, the best
+# candidate wasn't anyone's top pick, so its slot extraction is treated as
+# unreliable enough to hand off to the local LLM for a second pass.
+HYBRID_CONFIDENCE_THRESHOLD = 1.0 / (RRF_K + 1)
+# Absolute floor, used only when there is zero lexical overlap at all
+# (see _is_topically_relevant) - a candidate that is the *closest
+# available* match is not the same thing as a *relevant* match, since
+# cosine similarity always returns a nearest neighbor even among entirely
+# unrelated documents. 0.35 was too low: "give me a command to commit on
+# github" (no shared words with any seeded template at all) scored 0.459
+# against git_status and was wrongly accepted. Every genuine match observed
+# so far ("undo my changes to main.rs", "make a new branch called
+# feature-x", etc.) has real shared vocabulary and is accepted through the
+# lexical-overlap branch instead, never reaching this floor - so raising
+# it well above that observed false positive costs nothing they need.
+# Still a heuristic tuned on a handful of real examples, not a derived
+# constant; expect to revisit as the template corpus grows.
+MIN_ABSOLUTE_VECTOR_SIMILARITY = 0.6
 
 
 class SidecarRequest(BaseModel):
@@ -119,6 +166,7 @@ class SidecarTelemetry(BaseModel):
     hybrid_rrf_duration_ms: float = Field(default=0.0, ge=0.0)
     fast_path_evaluation_duration_ms: float = Field(default=0.0, ge=0.0)
     cache_freshness_check_duration_ms: float = Field(default=0.0, ge=0.0)
+    llm_fallback_duration_ms: float = Field(default=0.0, ge=0.0)
 
 
 class IntentProposal(BaseModel):
@@ -227,11 +275,21 @@ class QueryEncoder:
 class SearchService:
     """Coordinates FTS5 lexical lookup, FAISS search, RRF, and fast-path routing."""
 
-    def __init__(self, db_path: Path, encoder: QueryEncoder | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        encoder: QueryEncoder | None = None,
+        llm_client: OllamaClient | None = None,
+    ) -> None:
         self.db_path = db_path
         self.encoder = encoder or QueryEncoder()
         self.cache = VectorCache(db_path)
         self.gateway = FastPathGateway()
+        # Constructing OllamaClient only opens a urllib opener; it never
+        # touches the network until generate_proposal() is actually called,
+        # so the daemon still starts and serves fast-path/hybrid results
+        # fine even if Ollama was never installed.
+        self.llm_client = llm_client or OllamaClient()
         self._generation_lock = threading.Lock()
         self._known_generation: int | None = None
         self.rebuild_cache()
@@ -365,6 +423,63 @@ class SearchService:
                 return fast_decision.proposal
 
             top_hit = merged_hits[0] if merged_hits else None
+            if top_hit is not None and not self._is_topically_relevant(top_hit):
+                # Vector search always returns a nearest neighbor, even when
+                # nothing in the index is actually related to the query -
+                # there is no such thing as "no match" for cosine distance,
+                # only "less close." Ranking #1 among irrelevant candidates
+                # is not evidence of a real match. Without this floor, a
+                # totally unrelated query (e.g. asking about curl) could
+                # confidently resolve to whichever seeded template happens
+                # to sit nearest in embedding space - and if that template
+                # needs no slots, Rust has nothing left to catch the wrong
+                # guess with. Falling through with top_hit = None routes
+                # this into the exact same path as a genuine zero-hit miss.
+                top_hit = None
+
+            # Three independent reasons to consult the local LLM:
+            #   1. zero hits, where retrieval has no candidate at all and the
+            #      model may still emit a candidate_template_id that Rust will
+            #      reload and verify before use.
+            #   2. low confidence, where the candidate was not anyone's top
+            #      pick, so even which template applies is shaky.
+            #   3. the candidate IS confidently matched, but its schema
+            #      declares slots, and this code path (unlike the fast-path
+            #      gateway) has no deterministic way to fill them - without
+            #      the LLM, raw_untrusted_slots stays empty and Rust will
+            #      always reject the proposal as MissingRequiredSlot. A
+            #      confident match to a slotted template is therefore not
+            #      "done"; it has just identified what still needs slots.
+            if top_hit is None:
+                llm_proposal = self._attempt_zero_hit_llm_fallback(
+                    request=request,
+                    embedding_duration_ms=embedding_duration_ms,
+                    telemetry=telemetry,
+                )
+                if llm_proposal is not None:
+                    return llm_proposal
+            elif (
+                top_hit.rrf_score < HYBRID_CONFIDENCE_THRESHOLD
+                or self._candidate_declares_slots(top_hit.candidate)
+            ):
+                local_slots = self._attempt_local_slot_extraction(
+                    request=request,
+                    top_hit=top_hit,
+                    embedding_duration_ms=embedding_duration_ms,
+                    telemetry=telemetry,
+                )
+                if local_slots is not None:
+                    return local_slots
+
+                llm_proposal = self._attempt_llm_fallback(
+                    request=request,
+                    top_hit=top_hit,
+                    embedding_duration_ms=embedding_duration_ms,
+                    telemetry=telemetry,
+                )
+                if llm_proposal is not None:
+                    return llm_proposal
+
             return UntrustedProposal(
                 request_id=request.request_id,
                 source_provenance="LOCAL_HYBRID_RETRIEVAL",
@@ -595,7 +710,7 @@ class SearchService:
         tokens = []
         for token in FTS_TOKEN_RE.findall(query):
             cleaned = token.strip("./:+-")
-            if not cleaned:
+            if not cleaned or cleaned.lower() in FTS_STOPWORDS:
                 continue
             escaped = cleaned.replace('"', '""')
             tokens.append(f'"{escaped}"')
@@ -619,6 +734,260 @@ class SearchService:
     def _looks_like_path_request(query: str) -> bool:
         tokens = query.replace("\\", "/").split()
         return any("/" in token or "." in token or token.startswith("~") for token in tokens)
+
+    @staticmethod
+    def _is_topically_relevant(hit: HybridHit) -> bool:
+        """True if a hit has real evidence of relevance, not just rank.
+
+        A literal lexical match (any FTS5 hit at all) always counts: shared
+        vocabulary is a much stronger signal than embedding-space proximity
+        for short command-style queries. Absent that, the vector similarity
+        itself must clear an absolute floor - being *closest* among the
+        indexed documents is not evidence of being *close*.
+        """
+
+        if hit.lexical_rank is not None:
+            return True
+        return hit.vector_similarity is not None and hit.vector_similarity >= MIN_ABSOLUTE_VECTOR_SIMILARITY
+
+    @staticmethod
+    def _candidate_declares_slots(candidate: CandidateRecord) -> bool:
+        try:
+            schema = json.loads(candidate.slot_schema_json)
+        except json.JSONDecodeError:
+            LOGGER.error("slot_schema_json is malformed for doc_id=%s", candidate.doc_id)
+            return False
+        if isinstance(schema, dict):
+            schema = schema.get("slots", [])
+        return isinstance(schema, list) and len(schema) > 0
+
+    def _attempt_local_slot_extraction(
+        self,
+        request: SidecarRequest,
+        top_hit: HybridHit,
+        embedding_duration_ms: float,
+        telemetry: SidecarTelemetry,
+    ) -> UntrustedProposal | None:
+        """Extracts simple trusted-schema slots without invoking the LLM.
+
+        This deliberately handles only narrow, deterministic cases. Rust still
+        validates the produced slots against the trusted schema, path boundary,
+        and policy rules before execution.
+        """
+
+        slots = self._extract_slots_from_query(top_hit.candidate, request.query)
+        if slots is None:
+            return None
+
+        return UntrustedProposal(
+            request_id=request.request_id,
+            source_provenance="LOCAL_DETERMINISTIC_SLOTS",
+            intent_proposal=IntentProposal(
+                candidate_template_id=top_hit.candidate.doc_id,
+                typed_intent=top_hit.candidate.typed_intent,
+                retrieval_evidence=self._evidence(
+                    hit=top_hit,
+                    embedding_duration_ms=embedding_duration_ms,
+                ),
+                risk_hints=RiskHints(
+                    contains_path_arguments=self._looks_like_path_request(request.query)
+                ),
+                raw_untrusted_slots=slots,
+            ),
+            telemetry=telemetry,
+        )
+
+    @staticmethod
+    def _extract_slots_from_query(
+        candidate: CandidateRecord,
+        query: str,
+    ) -> dict[str, str] | None:
+        try:
+            schema = json.loads(candidate.slot_schema_json)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(schema, dict):
+            schema = schema.get("slots", [])
+        if not isinstance(schema, list) or not schema:
+            return None
+
+        extracted: dict[str, str] = {}
+        for rule in schema:
+            if not isinstance(rule, dict):
+                return None
+            name = rule.get("name")
+            formats = rule.get("allowed_formats", [])
+            if not isinstance(name, str) or not isinstance(formats, list):
+                return None
+
+            if "relative_path" in formats:
+                value = SearchService._extract_relative_path_token(query)
+            elif "safe_token" in formats:
+                value = SearchService._extract_named_safe_token(query)
+            else:
+                return None
+
+            if value is None:
+                return None
+            extracted[name] = value
+
+        return extracted
+
+    @staticmethod
+    def _extract_relative_path_token(query: str) -> str | None:
+        for raw in reversed(query.split()):
+            token = raw.strip(" \t\r\n'\"`.,;:()[]{}<>")
+            if not token or token.startswith(("/", "\\")) or ".." in token:
+                continue
+            if "/" not in token and "." not in token:
+                continue
+            if all(ch.isascii() and (ch.isalnum() or ch in "._-/\\") for ch in token):
+                return token
+        return None
+
+    @staticmethod
+    def _extract_named_safe_token(query: str) -> str | None:
+        patterns = (
+            r"\bcalled\s+([A-Za-z0-9._:@-]+)",
+            r"\bnamed\s+([A-Za-z0-9._:@-]+)",
+            r"\bbranch\s+([A-Za-z0-9._:@-]+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, query, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip(" \t\r\n'\"`.,;:()[]{}<>")
+        return None
+
+    def _attempt_llm_fallback(
+        self,
+        request: SidecarRequest,
+        top_hit: HybridHit,
+        embedding_duration_ms: float,
+        telemetry: SidecarTelemetry,
+    ) -> UntrustedProposal | None:
+        """Asks the local Ollama model to extract slots for a weak hybrid hit.
+
+        Only called when retrieval already named a specific candidate. The
+        model is anchored to that one candidate's trusted schema; it is never
+        allowed to override the candidate id chosen by retrieval, so
+        `candidate_template_id` always comes from `top_hit`, not from the
+        model's own (forbidden-to-trust-anyway) echo of it. Any failure here
+        - Ollama not installed, not running, or returning malformed output -
+        is logged once at warning level and treated as non-fatal: the caller
+        falls back to the existing hybrid-retrieval guess instead of failing
+        the whole request.
+        """
+
+        llm_started = time.perf_counter()
+        try:
+            llm_proposal = self.llm_client.generate_proposal(
+                request_id=request.request_id,
+                user_prompt=request.query,
+                candidate_template_id=top_hit.candidate.doc_id,
+                typed_intent=top_hit.candidate.typed_intent,
+                slot_schema_json=top_hit.candidate.slot_schema_json,
+            )
+        except (OllamaProtocolError, ConnectionError):
+            LOGGER.warning(
+                "local LLM fallback unavailable for request_id=%s; using hybrid retrieval guess instead",
+                request.request_id,
+                exc_info=True,
+            )
+            return None
+        finally:
+            telemetry.llm_fallback_duration_ms = (time.perf_counter() - llm_started) * 1000.0
+
+        return UntrustedProposal(
+            request_id=request.request_id,
+            source_provenance="LOCAL_LLM_GRAMMAR",
+            intent_proposal=IntentProposal(
+                candidate_template_id=top_hit.candidate.doc_id,
+                typed_intent=top_hit.candidate.typed_intent,
+                retrieval_evidence=self._evidence(
+                    hit=top_hit,
+                    embedding_duration_ms=embedding_duration_ms,
+                ),
+                risk_hints=RiskHints(
+                    contains_path_arguments=(
+                        self._looks_like_path_request(request.query)
+                        or llm_proposal.intent_proposal.risk_hints.contains_path_arguments
+                    )
+                ),
+                raw_untrusted_slots=llm_proposal.intent_proposal.raw_untrusted_slots,
+            ),
+            telemetry=telemetry,
+        )
+
+    def _attempt_zero_hit_llm_fallback(
+        self,
+        request: SidecarRequest,
+        embedding_duration_ms: float,
+        telemetry: SidecarTelemetry,
+    ) -> UntrustedProposal | None:
+        """Lets Ollama propose an intent when retrieval finds no template.
+
+        This is intentionally weakly trusted. The sidecar may return a
+        candidate_template_id, but Rust must still reload that id from SQLite
+        and run slot, path, policy, and lifecycle validation before anything
+        can execute. If Ollama is unavailable or emits a malformed envelope,
+        the caller falls through to the normal no-template response.
+        """
+
+        llm_started = time.perf_counter()
+        try:
+            llm_proposal = self.llm_client.generate_proposal(
+                request_id=request.request_id,
+                user_prompt=request.query,
+                candidate_template_id=None,
+                typed_intent="unknown_intent",
+                slot_schema_json="[]",
+            )
+        except (OllamaProtocolError, ConnectionError):
+            LOGGER.warning(
+                "zero-hit local LLM fallback unavailable for request_id=%s",
+                request.request_id,
+                exc_info=True,
+            )
+            return None
+        finally:
+            telemetry.llm_fallback_duration_ms = (time.perf_counter() - llm_started) * 1000.0
+
+        candidate_template_id = llm_proposal.intent_proposal.candidate_template_id
+        if not candidate_template_id:
+            # Catches both an explicit null and a hallucinated empty string -
+            # phi3:mini has been observed returning "" rather than null for
+            # "no real candidate," and an empty string is not a real doc_id.
+            # Letting it through would have Rust's fetch_trusted_template_by_doc_id
+            # hard-error on a lookup that can never succeed, instead of the
+            # clean OBSERVING outcome a genuine miss is supposed to produce.
+            LOGGER.warning(
+                "zero-hit LLM fallback returned no usable candidate_template_id for request_id=%s",
+                request.request_id,
+            )
+            return None
+
+        return UntrustedProposal(
+            request_id=request.request_id,
+            source_provenance="LOCAL_LLM_GRAMMAR",
+            intent_proposal=IntentProposal(
+                candidate_template_id=candidate_template_id,
+                typed_intent=llm_proposal.intent_proposal.typed_intent,
+                retrieval_evidence=RetrievalEvidence(
+                    fts5_lexical_score=None,
+                    vector_cosine_distance=None,
+                    vector_rank=None,
+                    embedding_duration_ms=embedding_duration_ms,
+                ),
+                risk_hints=RiskHints(
+                    contains_path_arguments=(
+                        self._looks_like_path_request(request.query)
+                        or llm_proposal.intent_proposal.risk_hints.contains_path_arguments
+                    )
+                ),
+                raw_untrusted_slots=llm_proposal.intent_proposal.raw_untrusted_slots,
+            ),
+            telemetry=telemetry,
+        )
 
     def handle_json(self, payload: bytes, dequeued_at: float | None = None) -> bytes:
         try:

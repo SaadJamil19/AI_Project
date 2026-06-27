@@ -1,6 +1,6 @@
 use crate::environment::SessionContext;
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -21,6 +21,18 @@ pub struct TrustedTemplate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LearnedTemplate {
     pub doc_id: String,
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservingRequest {
+    pub request_id: String,
+    pub raw_user_prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedCorrection {
+    pub request_id: String,
     pub argv: Vec<String>,
 }
 
@@ -173,6 +185,232 @@ pub fn insert_session_record(conn: &Connection, context: &SessionContext) -> Res
     )
     .context("failed to insert session record")?;
     Ok(session_id)
+}
+
+/// Reuses an existing, still-valid `session_records` row for this terminal
+/// (matched by `tty_device` + `user_id` + `hostname`) instead of always
+/// minting a fresh one, since `cli-agent` is a short-lived process that
+/// re-runs from scratch on every invocation. Without this, "the current
+/// terminal session" would never actually mean anything: two `ai-run`
+/// invocations a few seconds apart would otherwise get two unrelated
+/// `session_id`s, and nothing that correlates by session (like the
+/// passive-observation window below) could ever find a match. Falls back
+/// to `insert_session_record` when no matching, unexpired row exists.
+pub fn find_or_create_session_record(conn: &Connection, context: &SessionContext) -> Result<String> {
+    let existing: Option<String> = conn
+        .query_row(
+            r#"
+            SELECT session_id
+            FROM session_records
+            WHERE tty_device = ?1
+              AND user_id = ?2
+              AND hostname = ?3
+              AND expires_at > datetime('now')
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            params![context.tty_device, context.user_id, context.hostname],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to look up an existing session record for this terminal")?;
+
+    match existing {
+        Some(session_id) => Ok(session_id),
+        None => insert_session_record(conn, context),
+    }
+}
+
+/// Opens the request-tracking row a natural-language prompt is judged
+/// against for the rest of its lifecycle (slot validation, path validation,
+/// policy audit, and eventual approval or `SECURITY_BLOCKED` outcome).
+pub fn insert_request_record(
+    conn: &Connection,
+    session_id: &str,
+    raw_user_prompt: &str,
+) -> Result<String> {
+    let request_id = Uuid::new_v4().to_string();
+    conn.execute(
+        r#"
+        INSERT INTO request_records (
+            request_id, session_id, raw_user_prompt, execution_status, expires_at
+        )
+        VALUES (?1, ?2, ?3, 'PENDING', datetime('now', '+15 minutes'))
+        "#,
+        params![request_id, session_id, raw_user_prompt],
+    )
+    .context("failed to insert request record")?;
+    Ok(request_id)
+}
+
+/// Marks a request as `APPROVED` after its compiled argv has actually been
+/// executed. Mirrors `mark_request_security_blocked`'s transaction shape so
+/// every terminal state of a request goes through the same kind of guarded,
+/// auditable transition.
+pub fn mark_request_approved(conn: &mut Connection, request_id: &str) -> Result<()> {
+    if request_id.trim().is_empty() {
+        bail!("request_id must not be empty");
+    }
+
+    let tx = conn
+        .transaction()
+        .context("failed to start APPROVED request status transaction")?;
+    let changed = tx
+        .execute(
+            r#"
+            UPDATE request_records
+            SET execution_status = 'APPROVED'
+            WHERE request_id = ?1
+              AND execution_status IN ('PENDING', 'REJECTED')
+            "#,
+            params![request_id],
+        )
+        .with_context(|| format!("failed to transition request_id={} to APPROVED", request_id))?;
+
+    if changed != 1 {
+        bail!(
+            "request_id={} was not transitioned to APPROVED; request missing or already terminal",
+            request_id
+        );
+    }
+
+    tx.commit()
+        .context("failed to commit APPROVED request status transaction")?;
+    Ok(())
+}
+
+/// Marks a request `OBSERVING` instead of terminating it with a blind
+/// failure when a natural-language prompt matched no template at all. This
+/// is not a security failure — nothing unsafe was attempted, the system
+/// simply doesn't know what was meant yet — so it does not use
+/// `SECURITY_BLOCKED`. The expiry window is deliberately extended to 30
+/// days (`PENDING`/fresh requests only get 15 minutes): the passive
+/// observation loop this enables is explicitly meant to outlive a single
+/// terminal session, and `learn_from_request` refuses to act on an expired
+/// request_id.
+pub fn mark_request_observing(conn: &mut Connection, request_id: &str) -> Result<()> {
+    if request_id.trim().is_empty() {
+        bail!("request_id must not be empty");
+    }
+
+    let tx = conn
+        .transaction()
+        .context("failed to start OBSERVING request status transaction")?;
+    let changed = tx
+        .execute(
+            r#"
+            UPDATE request_records
+            SET execution_status = 'OBSERVING',
+                expires_at = datetime('now', '+30 days')
+            WHERE request_id = ?1
+              AND execution_status = 'PENDING'
+            "#,
+            params![request_id],
+        )
+        .with_context(|| format!("failed to transition request_id={} to OBSERVING", request_id))?;
+
+    if changed != 1 {
+        bail!(
+            "request_id={} was not transitioned to OBSERVING; request missing or already terminal",
+            request_id
+        );
+    }
+
+    tx.commit()
+        .context("failed to commit OBSERVING request status transaction")?;
+    Ok(())
+}
+
+/// Finds the most recent `OBSERVING` request for this terminal's session,
+/// created within `window_minutes`. Used right after a literal `ai-run`
+/// command actually executes, to decide whether that command is plausibly
+/// "the manual correction" for a natural-language prompt that just missed.
+pub fn find_recent_observing_request(
+    conn: &Connection,
+    session_id: &str,
+    window_minutes: i64,
+) -> Result<Option<ObservingRequest>> {
+    if window_minutes <= 0 {
+        bail!("window_minutes must be positive");
+    }
+    let window_modifier = format!("-{} minutes", window_minutes);
+
+    conn.query_row(
+        r#"
+        SELECT request_id, raw_user_prompt
+        FROM request_records
+        WHERE session_id = ?1
+          AND execution_status = 'OBSERVING'
+          AND created_at > datetime('now', ?2)
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        params![session_id, window_modifier],
+        |row| {
+            Ok(ObservingRequest {
+                request_id: row.get(0)?,
+                raw_user_prompt: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .context("failed to query for an active OBSERVING request")
+}
+
+/// Records `argv` as the candidate correction for `request_id`, but only
+/// the first time: once a correction is recorded it is never overwritten,
+/// so the *first* manual command after a miss is what gets remembered, not
+/// whatever the user happened to type last before the window closed.
+/// Returns whether this call actually recorded something new.
+pub fn record_observed_correction(conn: &Connection, request_id: &str, argv: &[String]) -> Result<bool> {
+    let argv_json = serde_json::to_string(argv).context("failed to encode observed correction argv JSON")?;
+    let changed = conn
+        .execute(
+            r#"
+            UPDATE request_records
+            SET observed_correction_argv_json = ?1
+            WHERE request_id = ?2
+              AND execution_status = 'OBSERVING'
+              AND observed_correction_argv_json IS NULL
+            "#,
+            params![argv_json, request_id],
+        )
+        .context("failed to record observed correction")?;
+    Ok(changed == 1)
+}
+
+/// Finds a previously observed correction for the exact same prompt text,
+/// regardless of session or how long ago it was observed — the point of
+/// this lookup is specifically to answer "have I seen this exact prompt
+/// before, with a known manual correction" across sessions, not just
+/// within one terminal's short observation window.
+pub fn find_observed_correction_for_prompt(
+    conn: &Connection,
+    raw_prompt: &str,
+) -> Result<Option<ObservedCorrection>> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            r#"
+            SELECT request_id, observed_correction_argv_json
+            FROM request_records
+            WHERE raw_user_prompt = ?1
+              AND execution_status = 'OBSERVING'
+              AND observed_correction_argv_json IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            params![raw_prompt],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("failed to query for an observed correction")?;
+
+    let Some((request_id, argv_json)) = row else {
+        return Ok(None);
+    };
+    let argv: Vec<String> =
+        serde_json::from_str(&argv_json).context("failed to decode observed correction argv JSON")?;
+    Ok(Some(ObservedCorrection { request_id, argv }))
 }
 
 pub fn fetch_trusted_template_by_doc_id(
@@ -379,16 +617,51 @@ fn fetch_learning_context(conn: &Connection, request_id: &str) -> Result<Request
     .with_context(|| format!("request_id={} is missing or expired", request_id))
 }
 
+/// Looks up the policy row that should govern a learned command.
+///
+/// Tries an exact `(binary_name, subcommand_path)` match first, then falls
+/// back to a binary-wide policy (`subcommand_path = ''`). The fallback
+/// matters because `audit_argv` already treats an empty policy
+/// `subcommand_path` as "no subcommand constraint" — one shared row can
+/// cover many subcommands through its flag allowlist instead of needing a
+/// dedicated row per subcommand. Without this fallback, learning anything
+/// beyond the exact subcommand a binary-wide policy happened to be seeded
+/// against would fail outright — and for a flag-only binary like `curl`,
+/// where `argv[1]` is always a flag rather than a real subcommand, the
+/// exact match can never succeed at all.
 fn find_policy_rule_id(conn: &Connection, binary_name: &str, subcommand_path: &str) -> Result<String> {
+    let exact: Option<String> = conn
+        .query_row(
+            r#"
+            SELECT rule_id
+            FROM policy_rules
+            WHERE binary_name = ?1
+              AND subcommand_path = ?2
+            LIMIT 1
+            "#,
+            params![binary_name, subcommand_path],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| {
+            format!(
+                "failed to query policy rule for binary={} subcommand={}",
+                binary_name, subcommand_path
+            )
+        })?;
+    if let Some(rule_id) = exact {
+        return Ok(rule_id);
+    }
+
     conn.query_row(
         r#"
         SELECT rule_id
         FROM policy_rules
         WHERE binary_name = ?1
-          AND subcommand_path = ?2
+          AND subcommand_path = ''
         LIMIT 1
         "#,
-        params![binary_name, subcommand_path],
+        params![binary_name],
         |row| row.get(0),
     )
     .with_context(|| {
@@ -453,13 +726,15 @@ CREATE TABLE IF NOT EXISTS request_records (
     request_id TEXT PRIMARY KEY NOT NULL,
     session_id TEXT NOT NULL,
     raw_user_prompt TEXT NOT NULL,
-    execution_status TEXT NOT NULL CHECK (execution_status IN ('PENDING', 'APPROVED', 'REJECTED', 'SECURITY_BLOCKED')),
+    execution_status TEXT NOT NULL CHECK (execution_status IN ('PENDING', 'APPROVED', 'REJECTED', 'SECURITY_BLOCKED', 'OBSERVING')),
+    observed_correction_argv_json TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     expires_at TIMESTAMP NOT NULL,
     FOREIGN KEY(session_id) REFERENCES session_records(session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_request_session_fk ON request_records(session_id);
+CREATE INDEX IF NOT EXISTS idx_request_observing_lookup ON request_records(session_id, execution_status, created_at);
 
 CREATE TABLE IF NOT EXISTS unified_documents (
     doc_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
